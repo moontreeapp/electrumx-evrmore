@@ -43,11 +43,20 @@ class PeerSession(RPCSession):
 
     async def handle_request(self, request):
         # We subscribe so might be unlucky enough to get a notification...
-        if (isinstance(request, Notification) and
-                request.method == 'blockchain.headers.subscribe'):
+        if (isinstance(request, Notification)
+                and request.method == 'blockchain.headers.subscribe'):
             pass
+        elif request.method == 'topic.update':
+            await self.handle_topic_update(request.params)
         else:
             await handler_invocation(None, request)   # Raises
+            # await super().handle_request(request)
+
+    async def handle_topic_update(self, params):
+        topic = params.get('topic')
+        data = params.get('data')
+        # Process the topic update as needed
+        self.logger.info(f'Received update for topic {topic}: {data}')
 
 
 class PeerManager:
@@ -56,6 +65,7 @@ class PeerManager:
     Attempts to maintain a connection with up to 8 peers.
     Issues a 'peers.subscribe' RPC to them and tells them our data.
     '''
+
     def __init__(self, env, db):
         self.logger = class_logger(__name__, self.__class__.__name__)
         # Initialise the Peer class
@@ -134,8 +144,8 @@ class PeerManager:
     def _get_recent_good_peers(self):
         cutoff = time.time() - STALE_SECS
         recent = [peer for peer in self.peers
-                  if peer.last_good > cutoff and
-                  not peer.bad and peer.is_public]
+                  if peer.last_good > cutoff
+                  and not peer.bad and peer.is_public]
         return recent
 
     async def _detect_proxy(self):
@@ -167,6 +177,9 @@ class PeerManager:
         for peer in peers:
             if not peer.is_public or (peer.is_tor and not self.proxy):
                 continue
+
+            # Store topics for each peer
+            peer.topics = self._get_peer_topics(peer)
 
             matches = peer.matches(match_set)
             if matches:
@@ -216,6 +229,43 @@ class PeerManager:
                 await peer.retry_event.wait()
                 peer.retry_event.clear()
 
+    async def _connect_to_peer(self, peer, callback):
+        peer.try_count += 1
+        for kind, port, family in peer.connection_tuples():
+            peer.last_try = time.time()
+            kwargs = {'family': family}
+            if kind == 'SSL':
+                kwargs['ssl'] = ssl.SSLContext(ssl.PROTOCOL_TLS)
+            if self.env.force_proxy or peer.is_tor:
+                if not self.proxy:
+                    return
+                kwargs['proxy'] = self.proxy
+                kwargs['resolve'] = not peer.is_tor
+            else:
+                # Use our listening Host/IP for outgoing non-proxy
+                # connections so our peers see the correct source.
+                local_hosts = {service.host for service in self.env.services
+                               if isinstance(service.host, (IPv4Address, IPv6Address))
+                               and service.protocol != 'rpc'}
+                if local_hosts:
+                    kwargs['local_addr'] = (str(local_hosts.pop()), None)
+            peer_text = f'[{peer}:{port} {kind}]'
+            try:
+                async with connect_rs(peer.host, port, session_factory=PeerSession,
+                                      **kwargs) as session:
+                    session.sent_request_timeout = 120 if peer.is_tor else 30
+                return True, await callback(session, peer)
+            except BadPeerError as e:
+                self.logger.error(f'{peer_text} marking bad: ({e})')
+                peer.mark_bad()
+                break
+            except (RPCError, ProtocolError) as e:
+                self.logger.error(f'{peer_text} RPC error: {e.message} '
+                                  f'({e.code})')
+            except (OSError, SOCKSError, ConnectionError, TaskTimeout) as e:
+                self.logger.info(f'{peer_text} {e}')
+            return False, None
+
     async def _should_drop_peer(self, peer):
         peer.try_count += 1
         is_good = False
@@ -257,42 +307,6 @@ class PeerManager:
                                   f'({e.code})')
             except (OSError, SOCKSError, ConnectionError, TaskTimeout) as e:
                 self.logger.info(f'{peer_text} {e}')
-
-        if is_good:
-            # Monotonic time would be better, but last_good and last_try are
-            # exported to admin RPC client.
-            now = time.time()
-            elapsed = now - peer.last_try
-            self.logger.info(f'{peer_text} verified in {elapsed:.1f}s')
-            peer.try_count = 0
-            peer.last_good = now
-            peer.source = 'peer'
-            # At most 2 matches if we're a host name, potentially
-            # several if we're an IP address (several instances
-            # can share a NAT).
-            matches = peer.matches(self.peers)
-            for match in matches:
-                if match.ip_address:
-                    if len(matches) > 1:
-                        self.peers.remove(match)
-                        # Force the peer's monitoring task to exit
-                        match.retry_event.set()
-                elif peer.host in match.features['hosts']:
-                    match.update_features_from_peer(peer)
-            # Trim this data structure
-            self.recent_peer_adds = {k: v for k, v in self.recent_peer_adds.items()
-                                     if v + PEER_ADD_PAUSE < now}
-        else:
-            # Forget the peer if long-term unreachable
-            if peer.last_good and not peer.bad:
-                try_limit = 10
-            else:
-                try_limit = 3
-            if peer.try_count >= try_limit:
-                desc = 'bad' if peer.bad else 'unreachable'
-                self.logger.info(f'forgetting {desc} peer: {peer}')
-                return True
-        return False
 
     async def _verify_peer(self, session, peer):
         # store IP address for peer
@@ -556,3 +570,23 @@ class PeerManager:
             return (peer.bad, -peer.last_good)
 
         return [peer_data(peer) for peer in sorted(self.peers, key=peer_key)]
+
+    async def send_topic_updates(self, topic, data):
+        '''Send updates related to a specific topic to interested peers.'''
+        for peer in self.peers:
+            if topic in peer.topics:
+                await self._send_topic_update(peer, topic, data)
+
+    async def _send_topic_update(self, peer, topic, data):
+        '''Send a topic update to a specific peer.'''
+        try:
+            success, result = await self._connect_to_peer(peer, lambda session, _: session.send_request('topic.update', {'topic': topic, 'data': data}))
+            if not success:
+                self.logger.error(f'Failed to send topic update to {peer}: {result}')
+        except Exception as e:
+            self.logger.error(f'Failed to send topic update to {peer}: {e}')
+
+    def _get_peer_topics(self, peer) -> set[str]:
+        '''Retrieve the topics a peer is interested in.'''
+        topics = peer.features.get('topics', [])
+        return set(topics)

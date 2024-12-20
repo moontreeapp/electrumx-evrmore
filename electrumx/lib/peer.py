@@ -46,7 +46,7 @@ class Peer(object):
     DEFAULT_PORTS = {}
 
     def __init__(self, host, features, source='unknown', ip_addr=None,
-                 last_good=0, last_try=0, try_count=0):
+                 last_good=0, last_try=0, try_count=0, topics=None):
         '''Create a peer given a host name (or IP address as a string),
         a dictionary of features, and a record of the source.'''
         assert isinstance(host, str)
@@ -70,6 +70,7 @@ class Peer(object):
         # Transient, non-persisted metadata
         self.bad = False
         self.other_port_pairs = set()
+        self.topics = topics or set()
 
     @classmethod
     def peers_from_features(cls, features, source):
@@ -187,7 +188,7 @@ class Peer(object):
         if ip_addr.version == 4:
             return str(ip_addr)
         elif ip_addr.version == 6:
-            slash64 = IPv6Network(self.ip_addr).supernet(prefixlen_diff=128-64)
+            slash64 = IPv6Network(self.ip_addr).supernet(prefixlen_diff=128 - 64)
             return str(slash64)
         return ''
 
@@ -201,10 +202,10 @@ class Peer(object):
             return ''
         ip_addr = ip_address(self.ip_addr)
         if ip_addr.version == 4:
-            slash16 = IPv4Network(self.ip_addr).supernet(prefixlen_diff=32-16)
+            slash16 = IPv4Network(self.ip_addr).supernet(prefixlen_diff=32 - 16)
             return str(slash16)
         elif ip_addr.version == 6:
-            slash56 = IPv6Network(self.ip_addr).supernet(prefixlen_diff=128-56)
+            slash56 = IPv6Network(self.ip_addr).supernet(prefixlen_diff=128 - 56)
             return str(slash56)
         return ''
 
@@ -278,6 +279,10 @@ class Peer(object):
     def protocol_max(self):
         '''Maximum protocol version as a string, e.g., 1.1'''
         return self._protocol_version_string('protocol_max')
+
+    @cachedproperty
+    def topics(self):
+        return self.features.get('topics', {})
 
     def to_tuple(self):
         '''The tuple ((ip, host, details) expected in response

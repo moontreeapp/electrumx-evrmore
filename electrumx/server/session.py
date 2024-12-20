@@ -90,6 +90,7 @@ def assert_tx_hash(value):
         pass
     raise RPCError(BAD_REQUEST, f'{value} should be a transaction hash')
 
+
 def assert_raw_bytes(value):
     '''Raise an RPCError if the value is not valid raw bytes (in hex).'''
     try:
@@ -97,6 +98,7 @@ def assert_raw_bytes(value):
     except (ValueError, TypeError):
         pass
     raise RPCError(BAD_REQUEST, f'argument should be hex-encoded bytes')
+
 
 @attr.s(slots=True)
 class SessionGroup:
@@ -131,7 +133,7 @@ class SessionManager:
         self.bp = bp
         self.daemon = daemon
         self.mempool = mempool
-        self.peer_mgr = PeerManager(env, db)
+        self.peer_mgr: 'PeerManager' = PeerManager(env, db)
         self.shutdown_event = shutdown_event
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.servers = {}           # service->server
@@ -621,7 +623,7 @@ class SessionManager:
             await self._start_external_servers()
             # Peer discovery should start after the external servers
             # because we connect to ourself
-            async with TaskGroup() as group:                
+            async with TaskGroup() as group:
                 await group.spawn(self.peer_mgr.discover_peers())
                 await group.spawn(self._clear_stale_sessions())
                 await group.spawn(self._handle_chain_reorgs())
@@ -919,7 +921,7 @@ class SessionBase(RPCSession):
     session_counter = itertools.count()
     log_new = False
 
-    def __init__(self, session_mgr, db: 'DB', mempool: 'MemPool', peer_mgr, kind, transport):
+    def __init__(self, session_mgr, db: 'DB', mempool: 'MemPool', peer_mgr: 'PeerManager', kind, transport):
         connection = JSONRPCConnection(JSONRPCAutoDetect)
         super().__init__(transport, connection=connection)
         self.session_mgr = session_mgr
@@ -944,9 +946,15 @@ class SessionBase(RPCSession):
         self.session_mgr.add_session(self)
         self.recalc_concurrency()  # must be called after session_mgr.add_session
         self.request_handlers = {}
+        self.topics = set()  # New attribute to store topics of interest
 
     async def notify(self, touched, height_changed, assets, q, h, b, f, v, qv):
-        pass
+        '''Notify the client about changes to touched addresses and assets.'''
+        # Example of sending topic-based notifications
+        # for topic in self.topics:
+        #    if topic in some_topic_data_source:
+        #        data = some_topic_data_source[topic]
+        #        await self.send_notification(f'topic.{topic}.update', data)
 
     def default_framer(self):
         return NewlineFramer(max_size=self.env.max_recv)
@@ -990,12 +998,23 @@ class SessionBase(RPCSession):
         '''
         if isinstance(request, Request):
             handler = self.request_handlers.get(request.method)
+            if handler is None and request.method == 'subscribe_topics':
+                return await self.subscribe_topics(request.params)
         else:
             handler = None
         method = 'invalid method' if handler is None else request.method
         self.session_mgr._method_counts[method] += 1
         coro = handler_invocation(handler, request)()
         return await coro
+
+    async def subscribe_topics(self, topics: set[str]):
+        '''Subscribe to a list of topics.'''
+        if isinstance(topics, list):
+            topics = set(topics)
+        if not isinstance(topics, set) or not all(isinstance(topic, str) for topic in topics):
+            raise RPCError(BAD_REQUEST, 'expected a list of topic strings')
+        self.topics.update(topics)
+        return f'Subscribed to topics: {", ".join(topics)}'
 
 
 def check_asset(name):
@@ -1012,6 +1031,7 @@ def check_asset(name):
             BAD_REQUEST, f'asset name greater than 32 characters'
         ) from None
 
+
 def check_h160(h160):
     if not isinstance(h160, str):
         raise RPCError(
@@ -1021,6 +1041,7 @@ def check_h160(h160):
         raise RPCError(
             BAD_REQUEST, f'h160 not 20 bytes'
         ) from None
+
 
 class ElectrumX(SessionBase):
     '''A TCP server that handles incoming Electrum connections.'''
@@ -1072,6 +1093,7 @@ class ElectrumX(SessionBase):
             'genesis_hash': env.coin.GENESIS_HASH,
             'hash_function': 'sha256',
             'services': [str(service) for service in env.report_services],
+            # 'topics': [unique topic names]
         }
 
     async def server_features_async(self):
@@ -1164,7 +1186,8 @@ class ElectrumX(SessionBase):
                 result = await self.get_restricted_string(asset)
                 await self.send_notification(method, (asset, result))
             es = '' if len(touched_asset_verifier_strings) == 1 else 's'
-            self.logger.info(f'notified of {len(touched_asset_verifier_strings):,d} verifier change{es}')
+            self.logger.info(
+                f'notified of {len(touched_asset_verifier_strings):,d} verifier change{es}')
 
         touched_qualifiers_that_are_in_verifiers = qv.intersection(self.qualifier_validator_subs)
         if touched_qualifiers_that_are_in_verifiers:
@@ -1173,7 +1196,8 @@ class ElectrumX(SessionBase):
                 status = await self.qualifier_associations_status(asset)
                 await self.send_notification(method, (f'#{asset}', status))
             es = '' if len(touched_qualifiers_that_are_in_verifiers) == 1 else 's'
-            self.logger.info(f'notified of {len(touched_qualifiers_that_are_in_verifiers):,d} qualifier{es} in verifier strings')
+            self.logger.info(
+                f'notified of {len(touched_qualifiers_that_are_in_verifiers):,d} qualifier{es} in verifier strings')
 
         touched = touched.intersection(self.hashX_subs.keys())
         if touched or (height_changed and self.mempool_statuses):
@@ -1202,7 +1226,6 @@ class ElectrumX(SessionBase):
             if changed:
                 es = '' if len(changed) == 1 else 'es'
                 self.logger.info(f'notified of {len(changed):,d} address{es}')
-
 
     async def subscribe_headers_result(self):
         '''The result of a header subscription or notification.'''
@@ -1255,19 +1278,21 @@ class ElectrumX(SessionBase):
         data = await self.qualifications_for_qualifier(qualifier)
         s_data = sorted(data.items(), key=lambda x: x[0])
         if s_data:
-            status = ';'.join(f'{h160}:{d["height"]}{d["tx_hash"]}{d["tx_pos"]}{d["flag"]}' for h160, d in s_data)
+            status = ';'.join(
+                f'{h160}:{d["height"]}{d["tx_hash"]}{d["tx_pos"]}{d["flag"]}' for h160, d in s_data)
             self.bump_cost(0.1 + len(status) * 0.00002)
             status = sha256(status.encode()).hex()
         else:
             self.bump_cost(0.1)
             status = None
         return status
-    
+
     async def tags_for_h160_status(self, h160):
         data = await self.qualifications_for_h160(h160)
         s_data = sorted(data.items(), key=lambda x: x[0])
         if s_data:
-            status = ';'.join(f'{asset}:{d["height"]}{d["tx_hash"]}{d["tx_pos"]}{d["flag"]}' for asset, d in s_data)
+            status = ';'.join(
+                f'{asset}:{d["height"]}{d["tx_hash"]}{d["tx_pos"]}{d["flag"]}' for asset, d in s_data)
             self.bump_cost(0.1 + len(status) * 0.00002)
             status = sha256(status.encode()).hex()
         else:
@@ -1279,19 +1304,21 @@ class ElectrumX(SessionBase):
         data = await self.get_messages(asset)
         s_data = sorted(data, key=lambda x: (x["height"], x['tx_hash'], x["tx_pos"]))
         if s_data:
-            status = ';'.join(f'{d["tx_hash"]}:{d["height"]}{d["tx_pos"]}{d["data"]}{d["expiration"]}' for d in s_data)
+            status = ';'.join(
+                f'{d["tx_hash"]}:{d["height"]}{d["tx_pos"]}{d["data"]}{d["expiration"]}' for d in s_data)
             self.bump_cost(0.1 + len(status) * 0.00002)
             status = sha256(status.encode()).hex()
         else:
             self.bump_cost(0.1)
             status = None
         return status
-    
+
     async def qualifier_associations_status(self, asset):
         data = await self.lookup_qualifier_associations(asset)
         s_data = sorted(data.items(), key=lambda x: x[0])
         if s_data:
-            status = ';'.join(f'{asset}:{d["height"]}{d["tx_hash"]}{d["restricted_tx_pos"]}{d["qualifying_tx_pos"]}{d["associated"]}' for asset, d in s_data)
+            status = ';'.join(
+                f'{asset}:{d["height"]}{d["tx_hash"]}{d["restricted_tx_pos"]}{d["qualifying_tx_pos"]}{d["associated"]}' for asset, d in s_data)
             self.bump_cost(0.1 + len(status) * 0.00002)
             status = sha256(status.encode()).hex()
         else:
@@ -1349,7 +1376,8 @@ class ElectrumX(SessionBase):
             check_asset(asset)
         elif isinstance(asset, Iterable):
             for a in asset:
-                if a is None: continue
+                if a is None:
+                    continue
                 check_asset(a)
         elif not isinstance(asset, bool):
             raise RPCError(
@@ -1411,7 +1439,7 @@ class ElectrumX(SessionBase):
         result = await self.broadcasts_status(asset)
         self.broadcast_subs.add(asset)
         return result
-    
+
     async def unsubscribe_broadcast(self, asset):
         check_asset(asset)
         return self.broadcast_subs.discard(asset) is not None
@@ -1431,7 +1459,7 @@ class ElectrumX(SessionBase):
         result = await self.get_restricted_string(asset)
         self.validator_subs.add(asset)
         return result
-    
+
     async def unsubscribe_restricted_verification_change(self, asset):
         check_asset(asset)
         return self.validator_subs.discard(asset) is not None
@@ -1461,7 +1489,8 @@ class ElectrumX(SessionBase):
             must_have_names = [asset]
         elif isinstance(asset, Iterable):
             for a in asset:
-                if a is None: continue
+                if a is None:
+                    continue
                 check_asset(a)
             must_have_names = asset
         elif not isinstance(asset, bool):
@@ -1486,7 +1515,7 @@ class ElectrumX(SessionBase):
         '''Return the confirmed and unconfirmed balance of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
         return await self.get_balance(hashX, asset)
-    
+
     async def unconfirmed_history(self, hashX):
         # Note unconfirmed history is unordered in electrum-server
         # height is -1 if it has unconfirmed inputs, otherwise 0
@@ -1773,7 +1802,8 @@ class ElectrumX(SessionBase):
         if onlytotal not in (True, False):
             raise RPCError(BAD_REQUEST, '"onlytotal" must be a boolean')
         if not isinstance(count, int) or count > 1000 or count < 1:
-            raise RPCError(BAD_REQUEST, '"count" must be an integer with a maximum value of 1000 and a minimum value of 1')
+            raise RPCError(
+                BAD_REQUEST, '"count" must be an integer with a maximum value of 1000 and a minimum value of 1')
         if not isinstance(start, int) or start < 0:
             raise RPCError(BAD_REQUEST, '"start" must be an integer and 0 or greater')
 
@@ -1907,10 +1937,9 @@ class ElectrumX(SessionBase):
 
             else:
                 asset_data = saved_data
-        
+
             return asset_data
 
-    
     async def get_assets_with_prefix(self, prefix: str):
         check_asset(prefix)
         ret = await self.db.get_assets_with_prefix(prefix.encode('ascii'))
@@ -2056,7 +2085,7 @@ class ElectrumX(SessionBase):
         if include_mempool:
             res_d = await self.lookup_qualifier_associations(asset)
             if res_d:
-                return res + [{         
+                return res + [{
                     'asset': asset,
                     'associated': mem_d['associated'],
                     'tx_hash': mem_d['tx_hash'],
@@ -2078,7 +2107,8 @@ class ElectrumX(SessionBase):
         if include_mempool:
             for res_asset in list(res.keys()):
                 res_d = await self.mempool.restricted_verifier(res_asset)
-                if not res_d: continue
+                if not res_d:
+                    continue
                 if asset not in re.findall(r'([A-Z0-9_.]+)', res_d['string']):
                     res[res_asset] = {
                         'associated': False,
@@ -2091,6 +2121,14 @@ class ElectrumX(SessionBase):
             for res_asset, d in mem_res.items():
                 res[res_asset] = d
         return res
+
+    async def handle_topic_update(self, topic: str, payload: str):
+        ''' relays this message to all peers subscribed to the topic '''
+        check_asset(topic)  # make sure it's a valid topic (topics share the same name of an asset on chain)
+        # relay to peers? how?
+        # self.peers.send_topic_updates(topic, payload)
+        self.peer_mgr.send_topic_updates(topic, payload)
+        return {'status': 'ok'}
 
     async def compact_fee_histogram(self):
         self.bump_cost(1.0)
@@ -2169,16 +2207,20 @@ class ElectrumX(SessionBase):
             'blockchain.asset.restricted_associations.subscribe': self.subscribe_qualifier_associated_restricted,
             'blockchain.asset.restricted_associations.unsubscribe': self.unsubscribe_qualifier_associated_restricted,
 
-            #1.12
+            # 1.12
             'blockchain.asset.get_meta_history': self.asset_get_meta_history,
             'blockchain.asset.verifier_string_history': self.get_restricted_string_history,
             'blockchain.tag.qualifier.history': self.qualifications_for_qualifier_history,
             'blockchain.tag.h160.history': self.qualifications_for_h160_history,
             'blockchain.asset.frozen_history': self.restricted_frozen_history,
             'blockchain.asset.restricted_associations_history': self.lookup_qualifier_associations_history,
+
+            # Magic Node updates
+            'topic.update': self.handle_topic_update,
         }
 
         self.request_handlers = handlers
+
 
 class LocalRPC(SessionBase):
     '''A local TCP RPC server session.'''
